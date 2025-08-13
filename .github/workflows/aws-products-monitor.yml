@@ -1,0 +1,254 @@
+# .github/workflows/aws-products-monitor.yml
+name: AWS Products Monitor
+
+# Trigger on schedule (every 6 hours) and manual dispatch
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:  # Allow manual trigger
+  
+env:
+  MONITORED_FILE_URL: "https://raw.githubusercontent.com/aws-samples/partner-crm-integration-samples/main/resources/aws_products.json"
+
+jobs:
+  monitor-aws-products:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        pip install requests openai jira python-dotenv
+        
+    - name: Download current AWS products file
+      run: |
+        curl -s "${{ env.MONITORED_FILE_URL }}" > current_aws_products.json
+        
+    - name: Check if previous version exists
+      id: check_previous
+      run: |
+        if [ -f "previous_aws_products.json" ]; then
+          echo "has_previous=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_previous=false" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Compare files and detect changes
+      id: detect_changes
+      run: |
+        if [ "${{ steps.check_previous.outputs.has_previous }}" = "true" ]; then
+          if ! cmp -s "previous_aws_products.json" "current_aws_products.json"; then
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
+            echo "🚨 Changes detected in AWS products file!"
+          else
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            echo "✅ No changes detected"
+          fi
+        else
+          echo "changes_detected=false" >> $GITHUB_OUTPUT
+          echo "📁 First run - setting baseline"
+        fi
+        
+    - name: Analyze changes with AI and create JIRA ticket
+      if: steps.detect_changes.outputs.changes_detected == 'true'
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+        JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        JIRA_URL: ${{ secrets.JIRA_URL }}
+        ENGINEERING_MANAGER_EMAIL: ${{ secrets.ENGINEERING_MANAGER_EMAIL }}
+      run: |
+        python << 'EOF'
+        import json
+        import os
+        import requests
+        from datetime import datetime
+        from openai import OpenAI
+        from jira import JIRA
+        
+        # Load data files
+        with open('previous_aws_products.json', 'r') as f:
+            previous_data = json.load(f)
+        with open('current_aws_products.json', 'r') as f:
+            current_data = json.load(f)
+        
+        # Initialize OpenAI client
+        openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
+        # AI Analysis
+        prompt = f"""
+        Analyze changes in this AWS products JSON file:
+        
+        PREVIOUS VERSION:
+        {json.dumps(previous_data, indent=2)[:2000]}...
+        
+        CURRENT VERSION:
+        {json.dumps(current_data, indent=2)[:2000]}...
+        
+        Provide analysis in JSON format:
+        {{
+            "summary": "Brief summary of changes",
+            "total_changes": number,
+            "priority": "high|medium|low",
+            "changes": [
+                {{
+                    "change_type": "added|removed|modified",
+                    "product_name": "name", 
+                    "details": "what changed",
+                    "impact_level": "high|medium|low"
+                }}
+            ],
+            "action_items": ["action 1", "action 2"],
+            "workspan_updates_needed": ["update 1", "update 2"]
+        }}
+        """
+        
+        try:
+            # Get AI analysis
+            response = openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are analyzing AWS product catalog changes for WorkSpan integration."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1
+            )
+            
+            analysis_text = response.choices[0].message.content
+            start = analysis_text.find('{')
+            end = analysis_text.rfind('}') + 1
+            analysis = json.loads(analysis_text[start:end])
+            
+            print("🤖 AI Analysis Complete:")
+            print(f"📊 {analysis['total_changes']} changes detected")
+            print(f"🎯 Priority: {analysis['priority']}")
+            
+            # Create JIRA ticket
+            jira = JIRA(
+                server=os.getenv('JIRA_URL'),
+                basic_auth=(os.getenv('JIRA_EMAIL'), os.getenv('JIRA_API_TOKEN'))
+            )
+            
+            # Create ticket description
+            description = f"""
+        ## Executive Summary
+        {analysis['summary']}
+        
+        ## Change Overview
+        * **Total Changes:** {analysis['total_changes']}
+        * **Priority Level:** {analysis['priority'].upper()}
+        * **Detection Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
+        
+        ## Detailed Changes
+        """
+            
+            for change in analysis['changes']:
+                description += f"* **{change['change_type'].upper()}**: {change['product_name']} - {change['details']} (Impact: {change['impact_level']})\n"
+            
+            description += f"""
+        ## Action Items Required
+        """
+            
+            for i, action in enumerate(analysis['action_items'], 1):
+                description += f"{i}. {action}\n"
+            
+            description += f"""
+        ## WorkSpan Updates Needed  
+        """
+            
+            for i, update in enumerate(analysis['workspan_updates_needed'], 1):
+                description += f"{i}. {update}\n"
+            
+            description += f"""
+        ## Resources
+        * [AWS Products Repository](https://github.com/aws-samples/partner-crm-integration-samples/blob/main/resources/aws_products.json)
+        * [GitHub Actions Workflow](https://github.com/${{{{ github.repository }}}}/actions)
+        * Generated automatically by GitHub Actions
+        
+        ## Next Steps
+        1. Engineering Manager: Review changes and plan implementation  
+        2. Product Manager: Update WorkSpan system per action items
+        3. QA Team: Test integrations after changes
+        4. Mark complete when all updates are done
+        """
+            
+            # Create JIRA issue
+            issue_dict = {
+                'project': {'key': 'PMT'},  # Product Management Tracker
+                'summary': f"AWS Products Update - {analysis['total_changes']} changes detected ({datetime.now().strftime('%Y-%m-%d')})",
+                'description': description,
+                'issuetype': {'name': 'Task'},
+                'priority': {'name': 'Medium' if analysis['priority'] == 'medium' else analysis['priority'].title()}
+            }
+            
+            new_issue = jira.create_issue(fields=issue_dict)
+            
+            # Add labels
+            new_issue.update(fields={'labels': ['aws-products', 'automation', 'workspan-update', 'github-actions']})
+            
+            print(f"🎫 JIRA Ticket Created: {new_issue.key}")
+            print(f"🔗 URL: {os.getenv('JIRA_URL')}/browse/{new_issue.key}")
+            
+            # Save ticket info for notification
+            with open('ticket_created.json', 'w') as f:
+                json.dump({
+                    'ticket_key': new_issue.key,
+                    'ticket_url': f"{os.getenv('JIRA_URL')}/browse/{new_issue.key}",
+                    'summary': analysis['summary'],
+                    'changes': analysis['total_changes'],
+                    'priority': analysis['priority']
+                }, f, indent=2)
+                
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            # Create fallback ticket
+            jira = JIRA(
+                server=os.getenv('JIRA_URL'),
+                basic_auth=(os.getenv('JIRA_EMAIL'), os.getenv('JIRA_API_TOKEN'))
+            )
+            
+            fallback_issue = jira.create_issue(fields={
+                'project': {'key': 'PMT'},
+                'summary': f"AWS Products Changed - Manual Review Required ({datetime.now().strftime('%Y-%m-%d')})",
+                'description': f"AWS products file changed but automated analysis failed. Please review manually.\n\nError: {e}\n\nFile: https://github.com/aws-samples/partner-crm-integration-samples/blob/main/resources/aws_products.json",
+                'issuetype': {'name': 'Task'},
+                'priority': {'name': 'Medium'}
+            })
+            
+            print(f"🎫 Fallback Ticket Created: {fallback_issue.key}")
+        EOF
+        
+    - name: Send notification (optional)
+      if: steps.detect_changes.outputs.changes_detected == 'true'
+      run: |
+        if [ -f "ticket_created.json" ]; then
+          echo "📧 Notification: JIRA ticket created for AWS products changes"
+          cat ticket_created.json
+          # Add email notification here if needed
+        fi
+        
+    - name: Update baseline file
+      run: |
+        cp current_aws_products.json previous_aws_products.json
+        
+    - name: Commit updated baseline
+      uses: stefanzweifel/git-auto-commit-action@v4
+      with:
+        commit_message: "Update AWS products baseline [skip ci]"
+        file_pattern: previous_aws_products.json
+        
+    - name: Summary
+      run: |
+        if [ "${{ steps.detect_changes.outputs.changes_detected }}" = "true" ]; then
+          echo "✅ AWS Products Monitor completed successfully"
+          echo "🎫 JIRA ticket created for detected changes"
+        else
+          echo "✅ AWS Products Monitor completed - no changes detected"
+        fi
