@@ -1,15 +1,24 @@
 # .github/workflows/aws-products-monitor.yml
 name: AWS Products Monitor
 
+# CONFIGURATION SECTION - Edit these values directly:
+# =====================================================
+# Schedule: Change the cron expression below
+# */5 * * * *  = Every 5 minutes (testing)
+# 0 */6 * * *  = Every 6 hours (production)
+# 0 9 * * 1    = Weekly Monday 9 AM
+
 on:
   schedule:
-    - cron: ${{ vars.MONITOR_SCHEDULE || '0 */6 * * *' }}  # Configurable schedule, default every 6 hours
-  workflow_dispatch:  # Allow manual trigger
-  
+    - cron: '*/5 * * * *'  # 🔧 EDIT THIS: Every 5 minutes for testing
+  workflow_dispatch:
+
+# 🔧 EDIT THESE SETTINGS:
 env:
-  MONITORED_FILE_URL: ${{ vars.MONITORED_FILE_URL || 'https://raw.githubusercontent.com/aws-samples/partner-crm-integration-samples/main/resources/aws_products.json' }}
-  JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY || 'PMT' }}
-  MONITOR_NAME: ${{ vars.MONITOR_NAME || 'AWS Products' }}
+  MONITORED_FILE_URL: 'https://github.com/piyushworkspan/AWSCheck/blob/main/aws_products.json'
+  JIRA_PROJECT_KEY: 'PMT'
+  MONITOR_NAME: 'AWS Products'
+  MONITOR_DESCRIPTION: 'AWS product catalog monitoring for WorkSpan integration'
 
 jobs:
   monitor-file-changes:
@@ -18,12 +27,12 @@ jobs:
     steps:
     - name: Display Configuration
       run: |
-        echo "🔧 Monitor Configuration:"
-        echo "=============================="
-        echo "📁 File URL: ${{ env.MONITORED_FILE_URL }}"
+        echo "🔧 AWS Products Monitor Configuration"
+        echo "====================================="
+        echo "📁 Monitoring: ${{ env.MONITORED_FILE_URL }}"
         echo "🎫 JIRA Project: ${{ env.JIRA_PROJECT_KEY }}"
         echo "📝 Monitor Name: ${{ env.MONITOR_NAME }}"
-        echo "⏰ Schedule: ${{ vars.MONITOR_SCHEDULE || '0 */6 * * *' }}"
+        echo "⏰ Schedule: Every 5 minutes (testing mode)"
         echo "🏢 Repository: ${{ github.repository }}"
         echo ""
     
@@ -39,69 +48,69 @@ jobs:
       run: |
         pip install requests openai jira python-dotenv
         
-    - name: Download current monitored file
+    - name: Download current AWS products file
       run: |
-        echo "📥 Downloading file from: ${{ env.MONITORED_FILE_URL }}"
+        echo "📥 Downloading: ${{ env.MONITORED_FILE_URL }}"
         curl -s "${{ env.MONITORED_FILE_URL }}" > current_file.json
         
         if [ $? -eq 0 ] && [ -s current_file.json ]; then
-          echo "✅ Successfully downloaded file"
+          echo "✅ File downloaded successfully"
           FILE_SIZE=$(wc -c < current_file.json)
           echo "📊 File size: $FILE_SIZE bytes"
+          
+          # Show first few lines for verification
+          echo "📄 File preview:"
+          head -5 current_file.json
         else
-          echo "❌ Failed to download file or file is empty"
+          echo "❌ Failed to download file"
           exit 1
         fi
         
-    - name: Get previous version from artifacts
+    - name: Get previous baseline
       uses: actions/download-artifact@v4
       with:
-        name: ${{ env.MONITOR_NAME }}-baseline
+        name: aws-products-baseline
         path: ./
       continue-on-error: true
       
-    - name: Detect changes in monitored file
+    - name: Compare and detect changes
       id: detect_changes
       run: |
         if [ -f "previous_file.json" ]; then
-          echo "📁 Found previous baseline file"
+          echo "📁 Previous baseline found"
           
           if ! cmp -s "previous_file.json" "current_file.json"; then
             echo "changes_detected=true" >> $GITHUB_OUTPUT
-            echo "🚨 Changes detected in monitored file!"
+            echo "🚨 CHANGES DETECTED!"
             
-            # File size comparison
             PREV_SIZE=$(wc -c < previous_file.json)
             CURR_SIZE=$(wc -c < current_file.json)
-            SIZE_DIFF=$((CURR_SIZE - PREV_SIZE))
+            DIFF=$((CURR_SIZE - PREV_SIZE))
             
-            echo "📊 Previous size: $PREV_SIZE bytes"
-            echo "📊 Current size: $CURR_SIZE bytes"
-            echo "📊 Size change: $SIZE_DIFF bytes"
+            echo "📊 Previous: $PREV_SIZE bytes"
+            echo "📊 Current: $CURR_SIZE bytes"  
+            echo "📊 Difference: $DIFF bytes"
             
             echo "prev_size=$PREV_SIZE" >> $GITHUB_OUTPUT
             echo "curr_size=$CURR_SIZE" >> $GITHUB_OUTPUT
-            echo "size_diff=$SIZE_DIFF" >> $GITHUB_OUTPUT
             
           else
             echo "changes_detected=false" >> $GITHUB_OUTPUT
-            echo "✅ No changes detected in monitored file"
+            echo "✅ No changes detected"
           fi
         else
-          echo "📁 No previous baseline - first run or artifact expired"
+          echo "📁 No baseline found - first run"
           echo "changes_detected=false" >> $GITHUB_OUTPUT
           echo "first_run=true" >> $GITHUB_OUTPUT
         fi
         
-    - name: Analyze changes and create JIRA ticket
+    - name: Create JIRA ticket for changes
       if: steps.detect_changes.outputs.changes_detected == 'true'
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
         JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         JIRA_URL: ${{ secrets.JIRA_URL }}
-        ENGINEERING_MANAGER_EMAIL: ${{ secrets.ENGINEERING_MANAGER_EMAIL }}
-        MONITOR_DESCRIPTION: ${{ vars.MONITOR_DESCRIPTION || 'Automated monitoring system detected changes in the tracked file' }}
       run: |
         python << 'EOF'
         import json
@@ -111,14 +120,7 @@ jobs:
         from openai import OpenAI
         from jira import JIRA
         
-        # Configuration from environment
-        MONITOR_NAME = os.getenv('MONITOR_NAME', 'File Monitor')
-        JIRA_PROJECT_KEY = os.getenv('JIRA_PROJECT_KEY', 'PMT')
-        MONITORED_URL = os.getenv('MONITORED_FILE_URL')
-        MONITOR_DESC = os.getenv('MONITOR_DESCRIPTION', 'File monitoring system detected changes')
-        
-        print(f"🤖 Starting analysis for {MONITOR_NAME}")
-        print(f"🎫 Target JIRA project: {JIRA_PROJECT_KEY}")
+        print("🤖 Starting change analysis...")
         
         # Load files
         try:
@@ -126,266 +128,166 @@ jobs:
                 previous_data = json.load(f)
             with open('current_file.json', 'r') as f:
                 current_data = json.load(f)
-                
-            print("✅ Successfully loaded both files for comparison")
-            
+            print("✅ Files loaded successfully")
         except Exception as e:
             print(f"❌ Error loading files: {e}")
             exit(1)
         
-        # Generate file hashes for tracking
-        def get_hash(data):
-            return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:8]
+        # Generate hashes
+        prev_hash = hashlib.sha256(json.dumps(previous_data, sort_keys=True).encode()).hexdigest()[:8]
+        curr_hash = hashlib.sha256(json.dumps(current_data, sort_keys=True).encode()).hexdigest()[:8]
         
-        prev_hash = get_hash(previous_data)
-        curr_hash = get_hash(current_data)
-        
-        print(f"📊 Previous hash: {prev_hash}")
-        print(f"📊 Current hash: {curr_hash}")
+        print(f"📊 Hash change: {prev_hash} → {curr_hash}")
         
         # AI Analysis
         try:
-            openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
             
-            # Create analysis prompt
             prompt = f"""
-            The monitored file "{MONITOR_NAME}" has been updated. 
+            AWS Products catalog file has been updated.
             
-            File URL: {MONITORED_URL}
-            Previous hash: {prev_hash}
-            Current hash: {curr_hash}
+            Previous file hash: {prev_hash}
+            Current file hash: {curr_hash}
             
-            This appears to be related to: {MONITOR_DESC}
+            This is likely an update to AWS services/products catalog for partner integration.
             
-            Based on the file change, provide analysis in this JSON format:
-            
+            Provide analysis in JSON format:
             {{
-                "summary": "Brief description of what likely changed in this file",
+                "summary": "AWS products catalog updated with service changes",
                 "total_changes": 1,
                 "priority": "medium",
                 "changes": [
                     {{
                         "change_type": "modified",
-                        "item_name": "{MONITOR_NAME}",
-                        "details": "File content updated - manual review recommended",
+                        "product_name": "AWS Products Catalog",
+                        "details": "Product catalog updated - review for new/modified services",
                         "impact_level": "medium"
                     }}
                 ],
                 "action_items": [
-                    "Review the updated file for specific changes",
-                    "Update related systems or processes as needed",
-                    "Test any integrations that depend on this file",
-                    "Notify relevant team members of the changes"
+                    "Review updated AWS products for new services",
+                    "Update WorkSpan integration mappings",
+                    "Test partner opportunity matching",
+                    "Verify pricing and availability data"
                 ],
-                "system_updates_needed": [
-                    "Review file changes in relevant admin consoles",
-                    "Update dependent configurations if needed",
-                    "Test related functionality",
-                    "Document changes for team reference"
+                "workspan_updates_needed": [
+                    "Check for new AWS services in catalog",
+                    "Update partner program rules if needed", 
+                    "Refresh service metadata",
+                    "Test co-sell opportunity generation"
                 ]
             }}
-            
-            Tailor the response to be appropriate for the type of file being monitored.
             """
             
-            print("🧠 Analyzing changes with AI...")
-            
-            response = openai_client.chat.completions.create(
+            response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
-                    {"role": "system", "content": f"You are analyzing changes to a monitored file ({MONITOR_NAME}) for a development/operations team. Provide actionable insights."},
+                    {"role": "system", "content": "Analyze AWS product catalog changes for WorkSpan integration."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.1,
-                max_tokens=800
+                temperature=0.1
             )
             
             analysis_text = response.choices[0].message.content
-            
-            # Parse AI response
             start = analysis_text.find('{')
             end = analysis_text.rfind('}') + 1
+            analysis = json.loads(analysis_text[start:end])
             
-            if start >= 0 and end > start:
-                analysis = json.loads(analysis_text[start:end])
-                print("✅ AI analysis completed successfully")
-            else:
-                raise ValueError("Could not parse AI response")
-                
+            print("✅ AI analysis completed")
+            
         except Exception as e:
-            print(f"⚠️ AI analysis failed ({e}), using fallback analysis")
-            
+            print(f"⚠️ AI failed, using fallback: {e}")
             analysis = {
-                "summary": f"{MONITOR_NAME} file updated (hash: {prev_hash} → {curr_hash})",
+                "summary": f"AWS products catalog updated (hash: {prev_hash} → {curr_hash})",
                 "total_changes": 1,
                 "priority": "medium",
-                "changes": [
-                    {
-                        "change_type": "modified",
-                        "item_name": MONITOR_NAME,
-                        "details": "Monitored file changed - manual review required",
-                        "impact_level": "medium"
-                    }
-                ],
-                "action_items": [
-                    f"Review changes in {MONITOR_NAME}",
-                    "Identify specific modifications made",
-                    "Update dependent systems as needed",
-                    "Test related functionality"
-                ],
-                "system_updates_needed": [
-                    "Review file changes manually",
-                    "Update related configurations",
-                    "Notify relevant team members",
-                    "Document changes for future reference"
-                ]
+                "changes": [{"change_type": "modified", "product_name": "AWS Products", "details": "File updated", "impact_level": "medium"}],
+                "action_items": ["Review file changes", "Update WorkSpan integration"],
+                "workspan_updates_needed": ["Check for new services", "Update mappings"]
             }
         
         # Create JIRA ticket
         try:
-            print(f"🎫 Creating JIRA ticket in {JIRA_PROJECT_KEY}...")
-            
             jira = JIRA(
                 server=os.getenv('JIRA_URL'),
                 basic_auth=(os.getenv('JIRA_EMAIL'), os.getenv('JIRA_API_TOKEN'))
             )
             
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            description = f"""# {MONITOR_NAME} Update Detected
-        
-        ## Summary
-        {analysis['summary']}
-        
-        ## Change Details
-        * **Detection Time**: {timestamp} UTC
-        * **Monitored File**: {MONITOR_NAME}
-        * **File URL**: {MONITORED_URL}
-        * **Changes Count**: {analysis['total_changes']}
-        * **Priority**: {analysis['priority'].upper()}
-        * **Hash Change**: `{prev_hash}` → `{curr_hash}`
-        * **Source**: GitHub Actions Monitor
-        
-        ## Detected Changes
-        """
-            
+            description = f"""# AWS Products Update Detected
+
+## Summary
+{analysis['summary']}
+
+## Details
+* **Detection**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
+* **Changes**: {analysis['total_changes']}
+* **Priority**: {analysis['priority'].upper()}
+* **Hash**: `{prev_hash}` → `{curr_hash}`
+
+## Changes Found
+"""
             for change in analysis['changes']:
-                description += f"* **{change['change_type'].upper()}**: {change['item_name']} - {change['details']} (Impact: {change['impact_level']})\n"
+                description += f"* **{change['change_type'].upper()}**: {change['product_name']} - {change['details']}\n"
             
-            description += "\n## Required Actions\n"
+            description += "\n## Action Items\n"
             for i, action in enumerate(analysis['action_items'], 1):
                 description += f"{i}. {action}\n"
             
-            description += "\n## System Updates Needed\n"
-            for i, update in enumerate(analysis['system_updates_needed'], 1):
+            description += "\n## WorkSpan Updates\n"
+            for i, update in enumerate(analysis['workspan_updates_needed'], 1):
                 description += f"{i}. {update}\n"
             
             description += f"""
-        ## Resources
-        * [Monitored File]({MONITORED_URL})
-        * [GitHub Actions Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
-        * [Monitor Repository](https://github.com/${{ github.repository }})
-        
-        ## Next Steps
-        1. **Review**: Check the file changes manually
-        2. **Update**: Apply necessary system updates  
-        3. **Test**: Verify dependent functionality
-        4. **Complete**: Mark ticket resolved when done
-        
-        ---
-        *Auto-generated by {MONITOR_NAME} Monitor*
-        """
+## Resources
+* [AWS Products File](https://github.com/aws-samples/partner-crm-integration-samples/blob/main/resources/aws_products.json)
+* [GitHub Actions Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+*Auto-generated by AWS Products Monitor*
+"""
             
-            # Create JIRA issue
-            issue_dict = {
-                'project': {'key': JIRA_PROJECT_KEY},
-                'summary': f"{MONITOR_NAME} Updated - Changes Detected ({datetime.now().strftime('%Y-%m-%d')})",
+            issue = jira.create_issue(fields={
+                'project': {'key': os.getenv('JIRA_PROJECT_KEY', 'PMT')},
+                'summary': f"AWS Products Updated - Changes Detected ({datetime.now().strftime('%Y-%m-%d')})",
                 'description': description,
                 'issuetype': {'name': 'Task'},
                 'priority': {'name': 'Medium'}
-            }
+            })
             
-            new_issue = jira.create_issue(fields=issue_dict)
-            
-            # Add labels
-            try:
-                labels = ['file-monitor', 'automation', MONITOR_NAME.lower().replace(' ', '-')]
-                new_issue.update(fields={'labels': labels})
-            except:
-                pass
-            
-            print(f"✅ JIRA ticket created successfully!")
-            print(f"🎫 Ticket: {new_issue.key}")
-            print(f"🔗 URL: {os.getenv('JIRA_URL')}/browse/{new_issue.key}")
-            
-            # Save results
-            with open('monitor_results.json', 'w') as f:
-                json.dump({
-                    'success': True,
-                    'ticket_key': new_issue.key,
-                    'ticket_url': f"{os.getenv('JIRA_URL')}/browse/{new_issue.key}",
-                    'monitor_name': MONITOR_NAME,
-                    'changes_detected': True,
-                    'priority': analysis['priority'],
-                    'timestamp': datetime.now().isoformat()
-                }, f, indent=2)
+            print(f"✅ JIRA ticket created: {issue.key}")
+            print(f"🔗 URL: {os.getenv('JIRA_URL')}/browse/{issue.key}")
             
         except Exception as e:
-            print(f"❌ JIRA ticket creation failed: {e}")
-            
-            with open('monitor_results.json', 'w') as f:
-                json.dump({
-                    'success': False,
-                    'error': str(e),
-                    'monitor_name': MONITOR_NAME,
-                    'changes_detected': True,
-                    'analysis_completed': True
-                }, f, indent=2)
+            print(f"❌ JIRA creation failed: {e}")
         
-        print("🏁 Analysis complete")
         EOF
         
     - name: Store new baseline
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ env.MONITOR_NAME }}-baseline
+        name: aws-products-baseline
         path: current_file.json
         retention-days: 90
         overwrite: true
         
-    - name: Display Results
+    - name: Summary
       run: |
-        echo "## 📊 ${{ env.MONITOR_NAME }} Monitor Results"
-        echo "============================================="
+        echo "## 🔍 AWS Products Monitor Summary"
+        echo "=================================="
         
         if [ "${{ steps.detect_changes.outputs.changes_detected }}" = "true" ]; then
           echo "🚨 **CHANGES DETECTED**"
-          echo ""
-          echo "📄 File: ${{ env.MONITORED_FILE_URL }}"
-          echo "📏 Size change: ${{ steps.detect_changes.outputs.prev_size }} → ${{ steps.detect_changes.outputs.curr_size }} bytes"
-          
-          if [ -f "monitor_results.json" ]; then
-            echo ""
-            echo "🎫 **JIRA Ticket Results:**"
-            cat monitor_results.json
-          fi
-          
-          echo ""
-          echo "✅ **Next Steps:**"
-          echo "   1. Check ${{ env.JIRA_PROJECT_KEY }} project for new ticket"
-          echo "   2. Review file changes manually"
-          echo "   3. Update dependent systems as needed"
+          echo "📊 Size: ${{ steps.detect_changes.outputs.prev_size }} → ${{ steps.detect_changes.outputs.curr_size }} bytes"
+          echo "🎫 JIRA ticket should be created in PMT project"
           
         elif [ "${{ steps.detect_changes.outputs.first_run }}" = "true" ]; then
-          echo "📁 **BASELINE ESTABLISHED**"
-          echo "   First monitoring run completed successfully"
-          echo "   File: ${{ env.MONITORED_FILE_URL }}"
+          echo "📁 **FIRST RUN - BASELINE SET**"
+          echo "Monitor is now active and watching for changes"
           
         else
-          echo "✅ **NO CHANGES DETECTED**"
-          echo "   Monitored file unchanged since last check"
+          echo "✅ **NO CHANGES**"
+          echo "AWS products file is unchanged"
         fi
         
         echo ""
-        echo "⏰ Next check: ${{ vars.MONITOR_SCHEDULE || 'Every 6 hours' }}"
-        echo "🔧 Manual trigger: Actions → ${{ env.MONITOR_NAME }} Monitor → Run workflow"
+        echo "⏰ Next check: In 5 minutes"
+        echo "🔧 Manual run: Actions → Run workflow"
