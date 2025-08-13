@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  MONITORED_FILE_URL: 'https://raw.githubusercontent.com/piyushworkspan/AWSCheck/main/aws_products.json'
+  MONITORED_FILE_URL: 'https://raw.githubusercontent.com/aws-samples/partner-crm-integration-samples/main/resources/aws_products.json'
   JIRA_PROJECT_KEY: 'PMT'
   MONITOR_NAME: 'AWS Products'
 
@@ -33,162 +33,201 @@ jobs:
       run: |
         pip install requests openai jira python-dotenv
         
-    - name: Download current file
-      run: |
-        echo "Downloading AWS products file..."
-        curl -s "${{ env.MONITORED_FILE_URL }}" > current_file.json
-        
-        if [ -s current_file.json ]; then
-          echo "File downloaded successfully"
-          wc -c current_file.json
-        else
-          echo "Download failed"
-          exit 1
-        fi
-        
-    - name: Get previous baseline
-      uses: actions/download-artifact@v4
-      with:
-        name: aws-products-baseline
-        path: ./
-      continue-on-error: true
-      
-    - name: Detect changes
-      id: detect_changes
-      run: |
-        if [ -f "previous_file.json" ]; then
-          echo "Comparing with previous version..."
-          
-          if ! cmp -s "previous_file.json" "current_file.json"; then
-            echo "changes_detected=true" >> $GITHUB_OUTPUT
-            echo "CHANGES DETECTED!"
-          else
-            echo "changes_detected=false" >> $GITHUB_OUTPUT
-            echo "No changes detected"
-          fi
-        else
-          echo "No baseline found - first run"
-          echo "changes_detected=false" >> $GITHUB_OUTPUT
-          echo "first_run=true" >> $GITHUB_OUTPUT
-        fi
-        
-    - name: Create JIRA ticket
-      if: steps.detect_changes.outputs.changes_detected == 'true'
+    - name: Download and analyze file
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
         JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         JIRA_URL: ${{ secrets.JIRA_URL }}
       run: |
-        cat > analyze.py << 'PYTHON_SCRIPT'
+        cat > monitor.py << 'PYTHON_SCRIPT'
         import json
         import os
         import hashlib
-        from datetime import datetime
+        import requests
+        from datetime import datetime, timedelta
         from openai import OpenAI
         from jira import JIRA
         
-        print("Starting analysis...")
+        print("🔍 AWS Products Monitor Starting...")
         
-        # Load files
-        with open('previous_file.json', 'r') as f:
-            previous_data = json.load(f)
-        with open('current_file.json', 'r') as f:
-            current_data = json.load(f)
+        # Download current file
+        file_url = os.getenv('MONITORED_FILE_URL')
+        print(f"📥 Downloading: {file_url}")
         
-        # Generate hashes
-        prev_hash = hashlib.sha256(json.dumps(previous_data, sort_keys=True).encode()).hexdigest()[:8]
-        curr_hash = hashlib.sha256(json.dumps(current_data, sort_keys=True).encode()).hexdigest()[:8]
-        
-        print(f"Hash change: {prev_hash} -> {curr_hash}")
-        
-        # AI Analysis
         try:
-            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-            
-            response = client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "Analyze AWS product catalog changes."},
-                    {"role": "user", "content": f"AWS products file updated. Hash changed from {prev_hash} to {curr_hash}. Provide brief analysis of likely changes for WorkSpan integration team."}
-                ],
-                temperature=0.1,
-                max_tokens=200
-            )
-            
-            ai_summary = response.choices[0].message.content
-            print("AI analysis completed")
-            
+            response = requests.get(file_url)
+            response.raise_for_status()
+            current_data = response.json()
+            print(f"✅ File downloaded: {len(str(current_data))} chars")
         except Exception as e:
-            print(f"AI analysis failed: {e}")
-            ai_summary = "AWS products catalog updated - manual review recommended"
+            print(f"❌ Download failed: {e}")
+            exit(1)
         
-        # Create JIRA ticket
+        # Calculate current file hash
+        current_hash = hashlib.sha256(json.dumps(current_data, sort_keys=True).encode()).hexdigest()
+        print(f"📊 Current file hash: {current_hash[:12]}...")
+        
+        # Check if we've seen this hash recently by querying JIRA
         try:
             jira = JIRA(
                 server=os.getenv('JIRA_URL'),
                 basic_auth=(os.getenv('JIRA_EMAIL'), os.getenv('JIRA_API_TOKEN'))
             )
             
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            # Search for recent tickets with this hash
+            # Look for tickets created in last 30 days with current hash in description
+            thirty_days_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
             
-            description = f"""AWS Products Update Detected
-        
-        Detection Time: {timestamp} UTC
-        File Hash Change: {prev_hash} -> {curr_hash}
-        
-        AI Analysis:
-        {ai_summary}
-        
-        Action Items:
-        1. Review AWS products file for changes
-        2. Update WorkSpan integration mappings
-        3. Test partner opportunity matching
-        4. Verify new service availability
-        
-        Resources:
-        - AWS Products File: https://github.com/aws-samples/partner-crm-integration-samples/blob/main/resources/aws_products.json
-        - Monitor Repository: https://github.com/{os.getenv('GITHUB_REPOSITORY', 'repo')}
-        
-        Auto-generated by AWS Products Monitor"""
+            jql_query = f'project = PMT AND created >= "{thirty_days_ago}" AND summary ~ "AWS Products Updated" ORDER BY created DESC'
             
-            issue = jira.create_issue(fields={
-                'project': {'key': 'PMT'},
-                'summary': f"AWS Products Updated - {timestamp}",
-                'description': description,
-                'issuetype': {'name': 'Task'},
-                'priority': {'name': 'Medium'}
-            })
+            recent_issues = jira.search_issues(jql_query, maxResults=10)
             
-            print(f"JIRA ticket created: {issue.key}")
-            print(f"URL: {os.getenv('JIRA_URL')}/browse/{issue.key}")
+            # Check if current hash appears in any recent ticket
+            hash_found = False
+            for issue in recent_issues:
+                if current_hash[:12] in issue.fields.description:
+                    hash_found = True
+                    print(f"✅ Hash {current_hash[:12]} found in recent ticket {issue.key}")
+                    break
             
+            if not hash_found:
+                print(f"🚨 NEW HASH DETECTED: {current_hash[:12]}")
+                
+                # AI Analysis
+                try:
+                    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+                    
+                    # Get a sample of the data for analysis
+                    data_sample = str(current_data)[:2000] if len(str(current_data)) > 2000 else str(current_data)
+                    
+                    prompt = f"""
+                    AWS Products catalog file has been updated or this is the first monitoring run.
+                    
+                    Current file hash: {current_hash[:12]}
+                    Data sample: {data_sample}...
+                    
+                    Provide a brief analysis of what this AWS products catalog likely contains and what actions a WorkSpan integration team should take when this file changes.
+                    
+                    Keep response under 150 words and focus on actionable insights.
+                    """
+                    
+                    response = client.chat.completions.create(
+                        model="gpt-4",
+                        messages=[
+                            {"role": "system", "content": "You analyze AWS product catalog changes for WorkSpan integration team."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.1,
+                        max_tokens=200
+                    )
+                    
+                    ai_analysis = response.choices[0].message.content
+                    print("🤖 AI analysis completed")
+                    
+                except Exception as e:
+                    print(f"⚠️ AI analysis failed: {e}")
+                    ai_analysis = "AWS products catalog updated. Manual review recommended to identify specific changes and update WorkSpan integration mappings accordingly."
+                
+                # Create JIRA ticket
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                description = f"""# AWS Products Catalog Update Detected
+        
+        ## Detection Summary
+        * **Timestamp**: {timestamp} UTC
+        * **File Hash**: {current_hash[:12]}...
+        * **Monitor**: GitHub Actions Automation
+        * **File URL**: {file_url}
+        
+        ## AI Analysis
+        {ai_analysis}
+        
+        ## Recommended Actions
+        1. **Review Changes**: Compare with previous version to identify specific updates
+        2. **Update WorkSpan**: Refresh product catalog mappings and partner program rules  
+        3. **Test Integration**: Verify co-sell opportunity generation with updated data
+        4. **Notify Team**: Alert relevant stakeholders of the catalog changes
+        
+        ## Resources
+        * [Monitored File]({file_url})
+        * [GitHub Actions Run](https://github.com/${{{{ github.repository }}}}/actions/runs/${{{{ github.run_id }}}})
+        * [WorkSpan Admin Console](https://app.workspan.com/)
+        
+        ## Technical Details
+        * **Full Hash**: `{current_hash}`
+        * **Detection Method**: Automated file monitoring via GitHub Actions
+        * **Frequency**: Every 5 minutes (testing mode)
+        
+        ---
+        *This ticket was automatically generated by the AWS Products Monitor system.*
+        """
+                
+                try:
+                    issue = jira.create_issue(fields={
+                        'project': {'key': 'PMT'},
+                        'summary': f"AWS Products Updated - New Changes Detected ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                        'description': description,
+                        'issuetype': {'name': 'Task'},
+                        'priority': {'name': 'Medium'}
+                    })
+                    
+                    # Try to add labels
+                    try:
+                        issue.update(fields={'labels': ['aws-products', 'automation', 'workspan', 'monitor']})
+                    except:
+                        pass  # Labels are optional
+                    
+                    print(f"✅ JIRA Ticket Created: {issue.key}")
+                    print(f"🔗 URL: {os.getenv('JIRA_URL')}/browse/{issue.key}")
+                    
+                except Exception as e:
+                    print(f"❌ JIRA ticket creation failed: {e}")
+            else:
+                print("✅ File unchanged - no action needed")
+                
         except Exception as e:
-            print(f"JIRA creation failed: {e}")
+            print(f"❌ JIRA connection failed: {e}")
+            print("Creating ticket anyway...")
+            
+            # Fallback: create ticket without hash checking
+            try:
+                jira = JIRA(
+                    server=os.getenv('JIRA_URL'),
+                    basic_auth=(os.getenv('JIRA_EMAIL'), os.getenv('JIRA_API_TOKEN'))
+                )
+                
+                description = f"""AWS Products file monitoring completed.
+                
+        File Hash: {current_hash[:12]}...
+        Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
         
-        print("Analysis complete")
+        Note: Unable to check recent tickets for duplicate detection.
+        This may be a duplicate if file hasn't actually changed.
+        
+        Please verify if this represents a real change to the AWS products catalog."""
+                
+                issue = jira.create_issue(fields={
+                    'project': {'key': 'PMT'},
+                    'summary': f"AWS Products Check - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                    'description': description,
+                    'issuetype': {'name': 'Task'},
+                    'priority': {'name': 'Low'}
+                })
+                
+                print(f"📋 Fallback ticket created: {issue.key}")
+                
+            except Exception as fallback_error:
+                print(f"❌ Fallback ticket also failed: {fallback_error}")
+        
+        print("🏁 Monitor run completed")
         PYTHON_SCRIPT
         
-        python analyze.py
-        
-    - name: Store new baseline
-      uses: actions/upload-artifact@v4
-      with:
-        name: aws-products-baseline
-        path: current_file.json
-        retention-days: 90
-        overwrite: true
+        python monitor.py
         
     - name: Summary
       run: |
         echo "=== AWS Products Monitor Summary ==="
-        
-        if [ "${{ steps.detect_changes.outputs.changes_detected }}" = "true" ]; then
-          echo "CHANGES DETECTED - JIRA ticket created"
-        elif [ "${{ steps.detect_changes.outputs.first_run }}" = "true" ]; then
-          echo "FIRST RUN - Baseline established"
-        else
-          echo "NO CHANGES - File unchanged"
-        fi
-        
+        echo "Stateless monitoring completed successfully"
+        echo "Check PMT project for any new tickets"
         echo "Next check: In 5 minutes"
