@@ -37,6 +37,7 @@ jobs:
         import hashlib
         import requests
         from datetime import datetime
+        from openai import OpenAI
         
         print("AWS Products Monitor Starting...")
         
@@ -73,6 +74,24 @@ jobs:
         with open(baseline_file, 'w') as f:
             f.write(current_hash)
         
+        # Save current data for comparison
+        with open('current_data.json', 'w') as f:
+            json.dump(current_data, f, indent=2)
+        
+        # Load previous data if it exists
+        previous_data = None
+        if os.path.exists('previous_data.json'):
+            try:
+                with open('previous_data.json', 'r') as f:
+                    previous_data = json.load(f)
+                print("Previous data loaded for comparison")
+            except Exception as e:
+                print(f"Could not load previous data: {e}")
+        
+        # Save current data as previous for next run
+        with open('previous_data.json', 'w') as f:
+            json.dump(current_data, f, indent=2)
+        
         # Determine if notification is needed
         should_notify = False
         change_type = "none"
@@ -94,6 +113,130 @@ jobs:
         if should_notify:
             print("Preparing email notification...")
             
+            # Accurate comparison analysis for changes only
+            ai_analysis = ""
+            if change_type == "file_changed" and previous_data is not None:
+                try:
+                    print("Performing accurate data comparison...")
+                    
+                    # Function to extract products with Name and ID
+                    def extract_products(data):
+                        products = {}
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, dict):
+                                    name = item.get('Name') or item.get('name') or item.get('ProductName') or item.get('product_name')
+                                    id_val = item.get('ID') or item.get('id') or item.get('Id') or item.get('ProductId') or item.get('product_id')
+                                    if name and id_val:
+                                        products[str(id_val)] = str(name)
+                        elif isinstance(data, dict):
+                            # Handle different JSON structures
+                            for key, value in data.items():
+                                if isinstance(value, list):
+                                    for item in value:
+                                        if isinstance(item, dict):
+                                            name = item.get('Name') or item.get('name') or item.get('ProductName') or item.get('product_name')
+                                            id_val = item.get('ID') or item.get('id') or item.get('Id') or item.get('ProductId') or item.get('product_id')
+                                            if name and id_val:
+                                                products[str(id_val)] = str(name)
+                                elif isinstance(value, dict):
+                                    name = value.get('Name') or value.get('name') or value.get('ProductName') or value.get('product_name')
+                                    id_val = value.get('ID') or value.get('id') or value.get('Id') or value.get('ProductId') or value.get('product_id')
+                                    if name and id_val:
+                                        products[str(id_val)] = str(name)
+                        return products
+                    
+                    # Extract products from both versions
+                    current_products = extract_products(current_data)
+                    previous_products = extract_products(previous_data)
+                    
+                    print(f"Current products found: {len(current_products)}")
+                    print(f"Previous products found: {len(previous_products)}")
+                    
+                    # Find differences
+                    added_ids = set(current_products.keys()) - set(previous_products.keys())
+                    removed_ids = set(previous_products.keys()) - set(current_products.keys())
+                    
+                    # Find modified (same ID but different Name)
+                    modified_ids = []
+                    for id_val in set(current_products.keys()) & set(previous_products.keys()):
+                        if current_products[id_val] != previous_products[id_val]:
+                            modified_ids.append(id_val)
+                    
+                    print(f"Added: {len(added_ids)}, Removed: {len(removed_ids)}, Modified: {len(modified_ids)}")
+                    
+                    # Build analysis
+                    analysis_parts = ["CHANGE SUMMARY:", ""]
+                    
+                    # Added products
+                    if added_ids:
+                        analysis_parts.append("AWS Products Added:")
+                        analysis_parts.append("| Name | ID |")
+                        analysis_parts.append("|------|-------|")
+                        for id_val in sorted(added_ids):
+                            name = current_products[id_val]
+                            analysis_parts.append(f"| {name} | {id_val} |")
+                    else:
+                        analysis_parts.append("AWS Products Added:")
+                        analysis_parts.append("No new products added")
+                    
+                    analysis_parts.append("")
+                    
+                    # Removed products  
+                    if removed_ids:
+                        analysis_parts.append("AWS Products Removed:")
+                        analysis_parts.append("| Name | ID |")
+                        analysis_parts.append("|------|-------|")
+                        for id_val in sorted(removed_ids):
+                            name = previous_products[id_val]
+                            analysis_parts.append(f"| {name} | {id_val} |")
+                    else:
+                        analysis_parts.append("AWS Products Removed:")
+                        analysis_parts.append("No products removed")
+                    
+                    analysis_parts.append("")
+                    
+                    # Modified products
+                    if modified_ids:
+                        analysis_parts.append("AWS Products Modified:")
+                        analysis_parts.append("| Previous Name | New Name | ID |")
+                        analysis_parts.append("|---------------|----------|-----|")
+                        for id_val in sorted(modified_ids):
+                            old_name = previous_products[id_val]
+                            new_name = current_products[id_val]
+                            analysis_parts.append(f"| {old_name} | {new_name} | {id_val} |")
+                    else:
+                        analysis_parts.append("AWS Products Modified:")
+                        analysis_parts.append("No product names changed")
+                    
+                    ai_analysis = "\n".join(analysis_parts)
+                    print("Accurate comparison completed")
+                    
+                except Exception as e:
+                    print(f"Comparison analysis failed: {e}")
+                    ai_analysis = """CHANGE SUMMARY:
+
+AWS Products Added:
+Data structure analysis failed - manual review required
+
+AWS Products Removed:  
+Data structure analysis failed - manual review required
+
+AWS Products Modified:
+Data structure analysis failed - manual review required"""
+            
+            elif change_type == "file_changed" and previous_data is None:
+                ai_analysis = """CHANGE SUMMARY:
+
+AWS Products Added:
+Cannot determine - no previous data for comparison
+
+AWS Products Removed:
+Cannot determine - no previous data for comparison  
+
+AWS Products Modified:
+Cannot determine - no previous data for comparison"""
+            
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
             
             if change_type == "first_run":
@@ -111,7 +254,7 @@ jobs:
         WHAT HAPPENS NEXT:
         - Monitor checks for file changes every 5 minutes
         - When changes are detected, you will receive email alerts
-        - Each alert will include analysis and action items
+        - Each alert will include a simple summary of what changed
         
         RECIPIENT CONFIGURATION:
         To modify who receives notifications:
@@ -134,53 +277,24 @@ jobs:
                 
             else:  # file_changed
                 subject = f"AWS Products CHANGED - Review Required ({datetime.now().strftime('%m/%d %H:%M')})"
-                body = f"""AWS PRODUCTS FILE CHANGED - ACTION REQUIRED
-        ==========================================
+                body = f"""AWS PRODUCTS FILE CHANGED
+        =======================
         
         Change Detected: {timestamp}
         Hash Change: {previous_hash} -> {current_hash}
         File URL: {file_url}
         
-        IMMEDIATE ACTIONS REQUIRED:
+        CHANGE SUMMARY:
+        {ai_analysis}
         
-        FOR PRODUCT TEAM:
-        1. Review AWS products catalog for new/modified services
-        2. Identify new partner opportunity types
-        3. Assess impact on existing WorkSpan configurations
-        4. Brief stakeholders on significant changes
-        
-        FOR ENGINEERING TEAM:
-        5. Update WorkSpan product mapping configurations
-        6. Test partner opportunity matching functionality
-        7. Verify co-sell program eligibility rules
-        8. Deploy integration updates if required
-        
-        FOR QA TEAM:
-        9. Test end-to-end partner workflows
-        10. Verify opportunity generation accuracy
-        11. Check reporting and analytics functions
-        
-        PRIORITY ASSESSMENT:
-        Changes to AWS products catalog may affect:
-        - Partner opportunity matching algorithms
-        - Co-sell program configurations  
-        - Integration API mappings
-        - Revenue reporting accuracy
-        
-        TECHNICAL DETAILS:
-        - Previous Hash: {previous_hash}
-        - Current Hash: {current_hash}
-        - Detection Method: SHA256 hash comparison
-        - File Size: {len(json_string)} bytes
+        Please review the changes and update WorkSpan integration as needed.
         
         RESOURCES:
         - Updated file: {file_url}
         - WorkSpan admin: https://app.workspan.com/
         
-        Please address these changes promptly to maintain optimal partner program performance.
-        
         ---
-        AWS Products Monitor | Critical Change Detection"""
+        AWS Products Monitor | Change Detection"""
             
             # Save email content to files
             with open('email_subject.txt', 'w') as f:
@@ -219,18 +333,19 @@ jobs:
         bcc: ${{ vars.EMAIL_BCC_LIST }}
         from: ${{ secrets.GMAIL_USERNAME }}
         
-    - name: Commit baseline file to repository
+    - name: Commit data files to repository
       run: |
-        if [ -f "file_baseline.txt" ]; then
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add file_baseline.txt
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Update AWS products baseline [skip ci]"
-            git push
-          fi
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # Add all tracking files
+        git add file_baseline.txt previous_data.json current_data.json 2>/dev/null || true
+        
+        if ! git diff --staged --quiet; then
+          git commit -m "Update AWS products baseline and data [skip ci]"
+          git push
+        else
+          echo "No changes to commit"
         fi
         
     - name: Display summary
