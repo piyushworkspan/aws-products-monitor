@@ -7,7 +7,6 @@ on:
 
 env:
   MONITORED_FILE_URL: 'https://raw.githubusercontent.com/piyushworkspan/AWSCheck/main/aws_products.json'
-  MONITOR_NAME: 'AWS Products'
 
 jobs:
   monitor:
@@ -17,26 +16,22 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
       
-    - name: Setup and Display Configuration
+    - name: Display Configuration
       run: |
-        echo "=== AWS Products Monitor Configuration ==="
+        echo "AWS Products Monitor - Multiple Recipients"
         echo "File: ${{ env.MONITORED_FILE_URL }}"
-        echo "Primary Recipients: ${{ vars.EMAIL_RECIPIENTS || 'Not configured' }}"
-        echo "CC Recipients: ${{ vars.EMAIL_CC_LIST || 'None' }}"
-        echo "BCC Recipients: ${{ vars.EMAIL_BCC_LIST || 'None' }}"
-        echo "Schedule: Every 5 minutes (testing)"
+        echo "Recipients: ${{ vars.EMAIL_RECIPIENTS || 'Not set' }}"
         echo "Time: $(date)"
-        echo ""
         
     - name: Install dependencies
       run: |
         pip install requests openai
         
-    - name: Download and Track Changes
+    - name: Monitor and Create Notification
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       run: |
-        cat > tracker.py << 'EOF'
+        cat > monitor.py << 'SCRIPT_END'
         import json
         import os
         import hashlib
@@ -44,225 +39,134 @@ jobs:
         from datetime import datetime
         from openai import OpenAI
         
-        def log_with_timestamp(message):
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+        print("AWS Products Monitor Starting...")
         
-        log_with_timestamp("🔍 AWS Products Monitor Starting...")
-        
-        # Download current file
+        # Download file
         file_url = os.getenv('MONITORED_FILE_URL')
-        log_with_timestamp(f"📥 Downloading: {file_url}")
+        print(f"Downloading: {file_url}")
         
         try:
-            response = requests.get(file_url, timeout=30)
+            response = requests.get(file_url)
             response.raise_for_status()
-            
-            # Try to parse as JSON
-            try:
-                current_data = response.json()
-                log_with_timestamp(f"✅ JSON parsed successfully: {len(str(current_data))} chars")
-            except json.JSONDecodeError as e:
-                log_with_timestamp(f"❌ JSON parse error: {e}")
-                log_with_timestamp(f"📄 Raw content preview: {response.text[:200]}...")
-                exit(1)
-                
-        except requests.RequestException as e:
-            log_with_timestamp(f"❌ Download failed: {e}")
+            current_data = response.json()
+            print(f"Downloaded successfully: {len(str(current_data))} chars")
+        except Exception as e:
+            print(f"Download failed: {e}")
             exit(1)
         
-        # Calculate current hash
-        current_content = json.dumps(current_data, sort_keys=True, separators=(',', ':'))
-        current_hash = hashlib.sha256(current_content.encode('utf-8')).hexdigest()
-        short_hash = current_hash[:16]  # Use longer hash for better tracking
+        # Calculate hash
+        current_hash = hashlib.sha256(json.dumps(current_data, sort_keys=True).encode()).hexdigest()[:16]
+        print(f"Current hash: {current_hash}")
         
-        log_with_timestamp(f"📊 Current file hash: {short_hash}")
-        log_with_timestamp(f"📊 File size: {len(current_content)} bytes")
-        
-        # Store current data for comparison
-        with open('current_file.json', 'w') as f:
-            json.dump(current_data, f, indent=2)
-        
-        # Check for previous hash in repository
+        # Check previous hash
         previous_hash = None
-        baseline_file = 'file_baseline.txt'
-        
-        if os.path.exists(baseline_file):
-            try:
-                with open(baseline_file, 'r') as f:
-                    previous_hash = f.read().strip()
-                log_with_timestamp(f"📋 Previous hash found: {previous_hash}")
-            except Exception as e:
-                log_with_timestamp(f"⚠️ Could not read previous hash: {e}")
+        if os.path.exists('baseline.txt'):
+            with open('baseline.txt', 'r') as f:
+                previous_hash = f.read().strip()
+            print(f"Previous hash: {previous_hash}")
         else:
-            log_with_timestamp("📁 No previous baseline found")
+            print("No previous hash found - first run")
         
-        # Always save current hash as new baseline
-        with open(baseline_file, 'w') as f:
-            f.write(short_hash)
+        # Save current hash
+        with open('baseline.txt', 'w') as f:
+            f.write(current_hash)
         
-        # Determine notification type
-        should_notify = False
-        notification_type = ""
+        # Determine if notification needed
+        send_notification = False
+        is_first_run = previous_hash is None
+        is_changed = previous_hash and previous_hash != current_hash
         
-        if previous_hash is None:
-            log_with_timestamp("📁 FIRST RUN - will send setup notification")
-            notification_type = "first_run"
-            should_notify = True
-        elif previous_hash != short_hash:
-            log_with_timestamp(f"🚨 CHANGE DETECTED! {previous_hash} → {short_hash}")
-            notification_type = "change_detected"
-            should_notify = True
+        if is_first_run:
+            print("First run - sending setup notification")
+            send_notification = True
+            notification_type = "setup"
+        elif is_changed:
+            print(f"Change detected: {previous_hash} -> {current_hash}")
+            send_notification = True
+            notification_type = "change"
         else:
-            log_with_timestamp("✅ No changes detected")
-            notification_type = "no_change"
-            should_notify = False
+            print("No changes detected")
+            send_notification = False
+            notification_type = "none"
         
-        # Save notification decision
-        with open('notify_decision.txt', 'w') as f:
-            f.write(f"{should_notify}|{notification_type}|{short_hash}|{previous_hash or 'none'}")
-        
-        if should_notify:
-            log_with_timestamp("📧 Preparing notification...")
+        if send_notification:
+            print("Preparing email notification...")
             
-            # AI Analysis for changes
+            # AI Analysis for changes only
             ai_analysis = ""
-            if notification_type == "change_detected":
+            if notification_type == "change":
                 try:
                     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-                    
-                    # Create a summary of the data for AI analysis
-                    data_summary = {
-                        'total_items': len(current_data) if isinstance(current_data, list) else len(current_data.keys()),
-                        'data_type': type(current_data).__name__,
-                        'sample_content': str(current_data)[:1000] + "..." if len(str(current_data)) > 1000 else str(current_data)
-                    }
-                    
-                    prompt = f"""
-                    AWS products catalog file has changed. Previous hash: {previous_hash}, New hash: {short_hash}
-                    
-                    Data summary: {json.dumps(data_summary, indent=2)}
-                    
-                    Please provide analysis of what likely changed in this AWS products catalog and specific actions the WorkSpan integration team should take. Focus on:
-                    1. What types of changes typically occur in AWS product catalogs
-                    2. Specific actions for WorkSpan integration team
-                    3. Priority assessment
-                    
-                    Keep response under 250 words and be actionable.
-                    """
                     
                     response = client.chat.completions.create(
                         model="gpt-4",
                         messages=[
-                            {"role": "system", "content": "You analyze AWS product catalog changes for enterprise integration teams. Be specific and actionable."},
-                            {"role": "user", "content": prompt}
+                            {"role": "system", "content": "Analyze AWS product catalog changes for WorkSpan integration team."},
+                            {"role": "user", "content": f"AWS products file changed from {previous_hash} to {current_hash}. Provide brief analysis and actions for WorkSpan team (150 words max)."}
                         ],
                         temperature=0.1,
-                        max_tokens=350
+                        max_tokens=200
                     )
                     
                     ai_analysis = response.choices[0].message.content
-                    log_with_timestamp("🤖 AI analysis completed")
+                    print("AI analysis completed")
                     
                 except Exception as e:
-                    log_with_timestamp(f"⚠️ AI analysis failed: {e}")
-                    ai_analysis = "AI analysis temporarily unavailable. Please manually review the AWS products catalog for changes that may impact WorkSpan partner integrations, opportunity matching, and co-sell program configurations."
+                    print(f"AI analysis failed: {e}")
+                    ai_analysis = "AI analysis unavailable. Please manually review AWS products catalog for WorkSpan integration impacts."
             
             # Create email content
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
             
-            if notification_type == "first_run":
-                subject = f"📁 AWS Products Monitor - Now Active ({datetime.now().strftime('%m/%d %H:%M')})"
-                body = f"""
-AWS Products Monitor - Setup Complete ✅
-=====================================
+            if notification_type == "setup":
+                subject = f"AWS Products Monitor - Setup Complete ({datetime.now().strftime('%m/%d %H:%M')})"
+                body = f"""AWS Products Monitor Setup Complete
+                
+Time: {timestamp}
+File: {file_url}  
+Baseline Hash: {current_hash}
 
-🎯 MONITOR STATUS: Active and operational
-📅 Monitoring started: {timestamp}
-🔗 File being tracked: {os.getenv('MONITORED_FILE_URL')}
-📊 Baseline hash established: {short_hash}
+The monitor is now active and will check for changes every 5 minutes.
+You'll receive notifications when the AWS products file changes.
 
-📋 WHAT HAPPENS NEXT:
-✅ Monitor runs every 5 minutes checking for file changes
-✅ When changes are detected, you'll receive detailed email alerts
-✅ AI analysis will be provided for each change
-✅ Specific action items will be included for your team
+To modify recipients:
+Settings -> Secrets and variables -> Actions -> Variables
+- EMAIL_RECIPIENTS (primary)
+- EMAIL_CC_LIST (CC) 
+- EMAIL_BCC_LIST (BCC)
 
-🛠️ CURRENT CONFIGURATION:
-- File: AWS Products Catalog
-- Frequency: Every 5 minutes (testing mode)
-- Analysis: AI-powered change detection
-- Recipients: {len([r for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()])} primary recipients
+Auto-generated setup notification."""
+                
+            else:  # change detected
+                subject = f"AWS Products CHANGED - Action Required ({datetime.now().strftime('%m/%d %H:%M')})"
+                body = f"""AWS PRODUCTS FILE CHANGED - REVIEW REQUIRED
 
-📧 EMAIL MANAGEMENT:
-To modify recipients, go to your repository:
-Settings → Secrets and variables → Actions → Variables
-- EMAIL_RECIPIENTS (primary recipients)
-- EMAIL_CC_LIST (CC recipients)
-- EMAIL_BCC_LIST (BCC recipients)
+Time: {timestamp}
+Hash Change: {previous_hash} -> {current_hash}
+File: {file_url}
 
-🔗 RESOURCES:
-- Monitored file: {os.getenv('MONITORED_FILE_URL')}
-- WorkSpan admin: https://app.workspan.com/
-
-This is your setup confirmation. Future emails will only be sent when the AWS products file changes.
-
----
-AWS Products Monitor | Automated by GitHub Actions
-                """
-            else:  # change_detected
-                subject = f"🚨 AWS Products CHANGED - Review Required ({datetime.now().strftime('%m/%d %H:%M')})"
-                body = f"""
-🚨 AWS PRODUCTS CATALOG CHANGED - ACTION REQUIRED
-==============================================
-
-📅 CHANGE DETECTED: {timestamp}
-📊 HASH CHANGE: {previous_hash} → {short_hash}
-🔗 FILE: {os.getenv('MONITORED_FILE_URL')}
-
-🤖 AI ANALYSIS:
+AI Analysis:
 {ai_analysis}
 
-🎯 IMMEDIATE ACTION CHECKLIST:
+Action Items:
+1. Review AWS products catalog changes
+2. Update WorkSpan integration mappings
+3. Test partner opportunity matching  
+4. Verify co-sell program rules
+5. Notify relevant stakeholders
 
-FOR PRODUCT TEAM:
-□ Review AWS products catalog for new/modified services
-□ Identify new partner opportunity types
-□ Assess impact on existing WorkSpan configurations
-□ Brief stakeholders on significant service additions
+Technical Details:
+- Previous: {previous_hash}
+- Current: {current_hash}
+- Detection: Automated hash comparison
 
-FOR ENGINEERING TEAM:
-□ Update WorkSpan product mapping configurations
-□ Test partner opportunity matching algorithms
-□ Verify co-sell program eligibility rules
-□ Deploy integration updates if required
+Resources:
+- File: {file_url}
+- WorkSpan: https://app.workspan.com/
 
-FOR QA TEAM:
-□ Test end-to-end partner workflows
-□ Verify opportunity generation accuracy
-□ Check reporting and analytics functions
+Please address changes promptly.
 
-⚠️ PRIORITY: Changes to AWS products catalog may affect:
-- Partner opportunity matching
-- Co-sell program configurations
-- Integration API mappings
-- Revenue reporting accuracy
-
-📊 TECHNICAL DETAILS:
-- Previous hash: {previous_hash}
-- Current hash: {short_hash}
-- Detection method: Automated SHA256 comparison
-- Change frequency: Typically quarterly
-
-🔗 RESOURCES:
-- Updated file: {os.getenv('MONITORED_FILE_URL')}
-- WorkSpan admin: https://app.workspan.com/
-- Integration docs: [Add your docs link]
-
-Please address these changes promptly to maintain optimal partner program performance.
-
----
-AWS Products Monitor | Critical Change Detection System
-                """
+Auto-generated change detection."""
             
             # Save email content
             with open('email_subject.txt', 'w') as f:
@@ -271,16 +175,19 @@ AWS Products Monitor | Critical Change Detection System
             with open('email_body.txt', 'w') as f:
                 f.write(body)
             
-            log_with_timestamp(f"📧 Email prepared: '{subject[:50]}...'")
-        else:
-            log_with_timestamp("📧 No notification needed")
+            print(f"Email prepared: {subject[:50]}...")
         
-        log_with_timestamp("🏁 Tracking completed successfully")
-        EOF
+        # Save status
+        status = f"{send_notification}|{notification_type}|{current_hash}|{previous_hash or 'none'}"
+        with open('status.txt', 'w') as f:
+            f.write(status)
         
-        python tracker.py
+        print("Monitor completed")
+        SCRIPT_END
         
-    - name: Send Email Notification
+        python monitor.py
+        
+    - name: Send Email
       if: hashFiles('email_body.txt') != ''
       uses: dawidd6/action-send-mail@v3
       with:
@@ -295,53 +202,32 @@ AWS Products Monitor | Critical Change Detection System
         bcc: ${{ vars.EMAIL_BCC_LIST }}
         from: ${{ secrets.GMAIL_USERNAME }}
         
-    - name: Commit baseline to repository
-      if: hashFiles('file_baseline.txt') != ''
+    - name: Commit baseline
       run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        
-        if [ -f "file_baseline.txt" ]; then
-          git add file_baseline.txt
-          git commit -m "Update AWS products baseline [automated]" || echo "No changes to commit"
-          git push || echo "Push failed - may be permissions issue"
+        if [ -f "baseline.txt" ]; then
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add baseline.txt
+          git commit -m "Update baseline" || echo "No changes"
+          git push || echo "Push may have failed"
         fi
         
-    - name: Display Summary
+    - name: Summary
       run: |
-        echo "=== 📊 AWS Products Monitor Summary ==="
-        echo "====================================="
+        echo "=== Monitor Summary ==="
         
-        if [ -f "notify_decision.txt" ]; then
-          DECISION=$(cat notify_decision.txt)
-          IFS='|' read -r SHOULD_NOTIFY TYPE CURRENT PREVIOUS <<< "$DECISION"
+        if [ -f "status.txt" ]; then
+          STATUS=$(cat status.txt)
+          IFS='|' read -r SENT TYPE CURRENT PREV <<< "$STATUS"
           
-          case "$TYPE" in
-            "first_run")
-              echo "📁 SETUP COMPLETE"
-              echo "   ✅ Baseline established: $CURRENT"  
-              echo "   📧 Setup notification sent"
-              echo "   ⚡ Monitor now active"
-              ;;
-            "change_detected")
-              echo "🚨 CHANGES DETECTED"
-              echo "   📊 Hash: $PREVIOUS → $CURRENT"
-              echo "   📧 Alert sent to team"
-              echo "   🎯 Action required"
-              ;;
-            "no_change")
-              echo "✅ NO CHANGES"
-              echo "   📊 Hash unchanged: $CURRENT"
-              echo "   📧 No notifications sent"
-              ;;
-          esac
+          if [ "$SENT" = "True" ]; then
+            echo "Notification sent: $TYPE"
+            echo "Hash: $PREV -> $CURRENT"
+          else
+            echo "No notification needed"
+            echo "Hash unchanged: $CURRENT"
+          fi
         fi
         
-        echo ""
-        echo "📧 CONFIGURED RECIPIENTS:"
-        echo "   TO: ${{ vars.EMAIL_RECIPIENTS || 'Not configured' }}"
-        echo "   CC: ${{ vars.EMAIL_CC_LIST || 'None' }}"
-        echo "   BCC: ${{ vars.EMAIL_BCC_LIST || 'None' }}"
-        echo ""
-        echo "⏰ Next check: In 5 minutes"
-        echo "🔧 Manual trigger: Actions → Run workflow"
+        echo "Recipients: ${{ vars.EMAIL_RECIPIENTS || 'Not configured' }}"
+        echo "Next check: In 5 minutes"
