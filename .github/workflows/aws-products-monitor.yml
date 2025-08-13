@@ -6,84 +6,98 @@ on:
   workflow_dispatch:
 
 env:
-  MONITORED_FILE_URL: 'https://raw.githubusercontent.com/aws-samples/partner-crm-integration-samples/main/resources/aws_products.json'
-  JIRA_PROJECT_KEY: 'PMT'
+  MONITORED_FILE_URL: 'https://raw.githubusercontent.com/piyushworkspan/AWSCheck/main/aws_products.json'
+  MONITOR_NAME: 'AWS Products'
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Setup
+    - name: Setup and Display Recipients
       run: |
-        echo "AWS Products Monitor - Every 5 minutes"
+        echo "AWS Products Monitor with Flexible Email Recipients"
         echo "File: ${{ env.MONITORED_FILE_URL }}"
+        echo "Primary Recipients: ${{ vars.EMAIL_RECIPIENTS || 'Not configured' }}"
+        echo "CC Recipients: ${{ vars.EMAIL_CC_LIST || 'None' }}"
+        echo "BCC Recipients: ${{ vars.EMAIL_BCC_LIST || 'None' }}"
+        echo "Frequency: Every 5 minutes (testing)"
         
     - name: Install dependencies
       run: |
-        pip install requests openai jira
+        pip install requests openai
         
-    - name: Run Monitor
+    - name: Monitor File and Prepare Notifications
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-        JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-        JIRA_URL: ${{ secrets.JIRA_URL }}
       run: |
         cat > monitor.py << 'EOF'
         import json
         import os
         import hashlib
         import requests
-        from datetime import datetime, timedelta
+        from datetime import datetime
         from openai import OpenAI
-        from jira import JIRA
         
-        print("AWS Products Monitor Starting...")
+        print("🔍 AWS Products Monitor Starting...")
         
         # Download current file
         file_url = os.getenv('MONITORED_FILE_URL')
-        print(f"Downloading: {file_url}")
+        print(f"📥 Downloading: {file_url}")
         
         try:
             response = requests.get(file_url)
             response.raise_for_status()
             current_data = response.json()
-            print(f"File downloaded successfully - {len(str(current_data))} characters")
+            print(f"✅ Downloaded: {len(str(current_data))} characters")
         except Exception as e:
-            print(f"Download failed: {e}")
+            print(f"❌ Download failed: {e}")
             exit(1)
         
         # Calculate hash
         current_hash = hashlib.sha256(json.dumps(current_data, sort_keys=True).encode()).hexdigest()
         short_hash = current_hash[:12]
-        print(f"File hash: {short_hash}")
+        print(f"📊 File hash: {short_hash}")
         
-        # Check JIRA for recent tickets with this hash
+        # Simple change detection using hash file
+        hash_file = 'last_hash.txt'
+        previous_hash = None
+        
         try:
-            jira = JIRA(
-                server=os.getenv('JIRA_URL'),
-                basic_auth=(os.getenv('JIRA_EMAIL'), os.getenv('JIRA_API_TOKEN'))
-            )
+            if os.path.exists(hash_file):
+                with open(hash_file, 'r') as f:
+                    previous_hash = f.read().strip()
+                    print(f"📋 Previous hash: {previous_hash}")
+        except:
+            print("📁 No previous hash found")
+        
+        # Save current hash for next run
+        with open(hash_file, 'w') as f:
+            f.write(short_hash)
+        
+        # Determine if we should send notification
+        send_notification = False
+        notification_type = ""
+        
+        if not previous_hash:
+            print("📁 FIRST RUN - establishing baseline")
+            notification_type = "first_run"
+            send_notification = True  # Send notification on first run for testing
+        elif previous_hash != short_hash:
+            print("🚨 CHANGE DETECTED!")
+            notification_type = "change_detected"
+            send_notification = True
+        else:
+            print("✅ No changes detected")
+            notification_type = "no_change"
+            send_notification = False
+        
+        if send_notification:
+            print("📧 Preparing email notification...")
             
-            # Search last 7 days for tickets with this hash
-            week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-            jql = f'project = PMT AND created >= "{week_ago}" AND summary ~ "AWS Products" ORDER BY created DESC'
-            
-            recent_issues = jira.search_issues(jql, maxResults=5)
-            
-            # Check if current hash exists in recent tickets
-            hash_exists = False
-            for issue in recent_issues:
-                if short_hash in issue.fields.description:
-                    hash_exists = True
-                    print(f"Hash found in recent ticket {issue.key} - no action needed")
-                    break
-            
-            if not hash_exists:
-                print("New hash detected - creating JIRA ticket")
-                
-                # AI Analysis
+            # AI Analysis (only for actual changes)
+            ai_analysis = ""
+            if notification_type == "change_detected":
                 try:
                     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
                     
@@ -92,64 +106,185 @@ jobs:
                     response = client.chat.completions.create(
                         model="gpt-4",
                         messages=[
-                            {"role": "system", "content": "Analyze AWS product catalog for WorkSpan integration team."},
-                            {"role": "user", "content": f"AWS products file updated. Hash: {short_hash}. Sample: {sample_data}... Provide brief analysis for WorkSpan team (100 words max)."}
+                            {"role": "system", "content": "You analyze AWS product catalog changes for WorkSpan integration team. Be specific and actionable."},
+                            {"role": "user", "content": f"AWS products file changed from hash {previous_hash} to {short_hash}. Sample: {sample_data}... Analyze likely changes and provide specific actions for WorkSpan integration (200 words max)."}
                         ],
                         temperature=0.1,
-                        max_tokens=150
+                        max_tokens=300
                     )
                     
-                    ai_summary = response.choices[0].message.content
-                    print("AI analysis completed")
+                    ai_analysis = response.choices[0].message.content
+                    print("🤖 AI analysis completed")
                     
                 except Exception as e:
-                    print(f"AI failed: {e}")
-                    ai_summary = "AWS products catalog updated. Review recommended for WorkSpan integration changes."
-                
-                # Create JIRA ticket
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                
-                description = f"""AWS Products Catalog Update
-                
-        Detection Time: {timestamp} UTC
-        File Hash: {short_hash}
-        File URL: {file_url}
-        
-        AI Analysis:
-        {ai_summary}
-        
-        Action Items:
-        1. Review AWS products file changes
-        2. Update WorkSpan integration mappings  
-        3. Test partner opportunity matching
-        4. Notify team of catalog updates
-        
-        Technical Details:
-        - Full Hash: {current_hash}
-        - Monitor: GitHub Actions
-        - Project: WorkSpan AWS Integration
-        
-        Auto-generated by AWS Products Monitor"""
-                
-                try:
-                    issue = jira.create_issue(fields={
-                        'project': {'key': 'PMT'},
-                        'summary': f"AWS Products Updated - {timestamp}",
-                        'description': description,
-                        'issuetype': {'name': 'Task'},
-                        'priority': {'name': 'Medium'}
-                    })
-                    
-                    print(f"JIRA ticket created: {issue.key}")
-                    print(f"URL: {os.getenv('JIRA_URL')}/browse/{issue.key}")
-                    
-                except Exception as e:
-                    print(f"JIRA creation failed: {e}")
+                    print(f"⚠️ AI analysis failed: {e}")
+                    ai_analysis = "AI analysis unavailable. Please manually review the AWS products file for changes that may affect WorkSpan integration mappings."
             
-        except Exception as e:
-            print(f"JIRA connection failed: {e}")
+            # Create email content based on notification type
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+            
+            if notification_type == "first_run":
+                email_subject = f"📁 AWS Products Monitor - Baseline Established ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
+                email_body = f"""
+        AWS Products Monitor - Initial Setup Complete
+        ============================================
         
-        print("Monitor completed")
+        🎯 MONITOR STATUS: Active and operational
+        📅 Baseline established: {timestamp}
+        🔗 Monitoring file: {file_url}
+        📊 Initial file hash: {short_hash}
+        
+        📋 WHAT'S NEXT:
+        ✅ Monitor is now tracking changes every 5 minutes
+        ✅ You'll receive notifications when the AWS products file changes
+        ✅ Each notification will include AI-powered analysis of changes
+        ✅ Recommendations will be provided for WorkSpan integration updates
+        
+        🛠️ CONFIGURATION:
+        - Monitor frequency: Every 5 minutes (testing mode)
+        - File being monitored: AWS Products Catalog
+        - Analysis: AI-powered change detection
+        
+        📧 RECIPIENT MANAGEMENT:
+        To modify who receives these notifications, update the repository variables:
+        - EMAIL_RECIPIENTS (primary recipients)
+        - EMAIL_CC_LIST (CC recipients)  
+        - EMAIL_BCC_LIST (BCC recipients)
+        
+        🔗 RESOURCES:
+        - Monitored file: {file_url}
+        - WorkSpan admin: https://app.workspan.com/
+        
+        This is a one-time setup notification. Future emails will only be sent when the AWS products file actually changes.
+        
+        ---
+        AWS Products Monitor v2.0 | Auto-generated by GitHub Actions
+        """
+            else:  # change_detected
+                email_subject = f"🚨 AWS Products CHANGED - Action Required ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
+                email_body = f"""
+        🚨 AWS PRODUCTS FILE CHANGED - IMMEDIATE ATTENTION REQUIRED
+        =========================================================
+        
+        📅 DETECTION TIME: {timestamp}
+        📊 HASH CHANGE: {previous_hash} → {short_hash}
+        🔗 FILE URL: {file_url}
+        
+        🤖 AI ANALYSIS:
+        {ai_analysis}
+        
+        🎯 IMMEDIATE ACTION ITEMS:
+        
+        FOR PRODUCT MANAGEMENT TEAM:
+        1. 🔍 Review the specific changes in the AWS products catalog
+        2. 🎯 Identify new services that could create partner opportunities
+        3. 📊 Assess impact on existing WorkSpan program rules
+        4. 📢 Brief relevant stakeholders on significant changes
+        
+        FOR ENGINEERING TEAM:
+        5. 🔄 Update WorkSpan product mapping configurations
+        6. 🧪 Test partner opportunity matching with new data
+        7. ✅ Verify co-sell program eligibility rules are current
+        8. 🛠️ Deploy any necessary integration updates
+        
+        FOR QA TEAM:
+        9. 🧪 Test end-to-end partner workflows with updated catalog
+        10. ✅ Verify opportunity generation is working correctly
+        
+        📊 TECHNICAL DETAILS:
+        - Previous hash: {previous_hash}
+        - Current hash: {short_hash}  
+        - Full hash: {current_hash}
+        - Change detection: Automated via GitHub Actions
+        
+        🔗 RESOURCES:
+        - Updated file: {file_url}
+        - WorkSpan admin console: https://app.workspan.com/
+        - GitHub Actions run: Check your repository Actions tab
+        
+        ⚠️ PRIORITY: This change may affect partner program functionality. Please address promptly.
+        
+        ---
+        AWS Products Monitor v2.0 | Auto-generated detection system
+        """
+            
+            # Save email content
+            with open('email_content.txt', 'w') as f:
+                f.write(email_body)
+            
+            with open('email_subject.txt', 'w') as f:
+                f.write(email_subject)
+            
+            print(f"📧 Email prepared: {email_subject}")
+        else:
+            print("📧 No notification needed - file unchanged")
+        
+        # Create status file for workflow
+        with open('monitor_status.txt', 'w') as f:
+            f.write(f"{notification_type}|{short_hash}|{previous_hash or 'none'}")
+        
+        print("🏁 Monitor completed successfully")
         EOF
         
         python monitor.py
+        
+    - name: Send Email to Multiple Recipients
+      if: hashFiles('email_content.txt') != ''
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 587
+        username: ${{ secrets.GMAIL_USERNAME }}
+        password: ${{ secrets.GMAIL_APP_PASSWORD }}
+        subject: file://email_subject.txt
+        body: file://email_content.txt
+        to: ${{ vars.EMAIL_RECIPIENTS || secrets.EMAIL_TO || 'default@company.com' }}
+        cc: ${{ vars.EMAIL_CC_LIST }}
+        bcc: ${{ vars.EMAIL_BCC_LIST }}
+        from: ${{ secrets.GMAIL_USERNAME }}
+        content_type: text/plain
+        
+    - name: Display Notification Summary
+      run: |
+        echo "=== 📊 AWS Products Monitor Summary ==="
+        echo "======================================"
+        
+        if [ -f "monitor_status.txt" ]; then
+          STATUS=$(cat monitor_status.txt)
+          IFS='|' read -r TYPE CURRENT PREVIOUS <<< "$STATUS"
+          
+          case "$TYPE" in
+            "first_run")
+              echo "📁 FIRST RUN COMPLETED"
+              echo "   ✅ Baseline established: $CURRENT"
+              echo "   📧 Setup notification sent to team"
+              echo "   ⚡ Monitor now active for change detection"
+              ;;
+            "change_detected") 
+              echo "🚨 CHANGES DETECTED AND NOTIFIED"
+              echo "   📊 Hash changed: $PREVIOUS → $CURRENT"
+              echo "   📧 Alert sent to all configured recipients"
+              echo "   🎯 Team action required"
+              ;;
+            "no_change")
+              echo "✅ NO CHANGES DETECTED"
+              echo "   📊 File hash unchanged: $CURRENT"
+              echo "   📧 No notifications sent"
+              ;;
+          esac
+        else
+          echo "⚠️ Monitor status unknown"
+        fi
+        
+        echo ""
+        echo "📧 CURRENT RECIPIENTS:"
+        echo "   Primary: ${{ vars.EMAIL_RECIPIENTS || 'Not configured in variables' }}"
+        echo "   CC: ${{ vars.EMAIL_CC_LIST || 'None' }}"  
+        echo "   BCC: ${{ vars.EMAIL_BCC_LIST || 'None' }}"
+        echo ""
+        echo "⏰ Next check: In 5 minutes"
+        echo "🔧 Manual trigger: Actions → Run workflow"
+        echo ""
+        echo "💡 TO MODIFY RECIPIENTS:"
+        echo "   Go to Settings → Secrets and variables → Actions → Variables"
+        echo "   Add/edit: EMAIL_RECIPIENTS, EMAIL_CC_LIST, EMAIL_BCC_LIST"
