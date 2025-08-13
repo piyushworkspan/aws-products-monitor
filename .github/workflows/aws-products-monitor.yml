@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  MONITORED_FILE_URL: 'https://github.com/piyushworkspan/AWSCheck/blob/main/aws_products.json'
+  MONITORED_FILE_URL: 'https://raw.githubusercontent.com/piyushworkspan/AWSCheck/main/aws_products.json'
   JIRA_PROJECT_KEY: 'PMT'
   MONITOR_NAME: 'AWS Products'
 
